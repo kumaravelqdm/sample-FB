@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Register Device</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .container {
+      background: white;
+      border-radius: 10px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+      max-width: 400px;
+      width: 100%;
+      padding: 40px;
+    }
+    h2 { color: #333; margin-bottom: 30px; text-align: center; font-size: 24px; }
+    .form-group { margin-bottom: 20px; }
+    label { display: block; color: #555; font-weight: 500; margin-bottom: 8px; font-size: 14px; }
+    input, textarea {
+      width: 100%; padding: 12px; border: 1px solid #ddd;
+      border-radius: 6px; font-size: 14px; font-family: inherit; transition: border-color 0.3s;
+    }
+    input:focus, textarea:focus {
+      outline: none; border-color: #667eea;
+      box-shadow: 0 0 0 3px rgba(102,126,234,0.1);
+    }
+    textarea { resize: vertical; min-height: 80px; }
+    button {
+      width: 100%; padding: 12px;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white; border: none; border-radius: 6px;
+      font-size: 16px; font-weight: 600; cursor: pointer;
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+    button:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(102,126,234,0.4); }
+    button:active { transform: translateY(0); }
+    .loading { opacity: 0.7; cursor: not-allowed; }
+    .error { color: #e74c3c; font-size: 13px; margin-top: 5px; display: none; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <h2>Register Device</h2>
+  <form onsubmit="handleRegister(event)">
+    <div class="form-group">
+      <label for="deviceName">Device Name *</label>
+      <input type="text" id="deviceName" placeholder="e.g., Office Laptop" required>
+    </div>
+    <div class="form-group">
+      <label for="storeName">Store Name *</label>
+      <input type="text" id="storeName" placeholder="e.g., Main Store" required>
+    </div>
+    <div class="form-group">
+      <label for="addedBy">Added By *</label>
+      <input type="text" id="addedBy" placeholder="e.g., John Doe" required>
+    </div>
+    <div class="form-group">
+      <label for="remarks">Remarks</label>
+      <textarea id="remarks" placeholder="Any additional notes..."></textarea>
+    </div>
+    <button type="submit" id="registerBtn">Register Device</button>
+    <div class="error" id="errorMsg"></div>
+  </form>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/js-sha256@0.9.0/build/sha256.min.js"></script>
+<script>
+
+// ============================================================
+//  HASH
+// ============================================================
+async function generateHash(str) {
+  if (window.crypto?.subtle?.digest) {
+    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
+    return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+  }
+  return sha256(str);
+}
+
+// ============================================================
+//  UUID
+// ============================================================
+function generateUUID() {
+  if (crypto?.randomUUID) return crypto.randomUUID();
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, c => {
+    const r = (Math.random() * 16) | 0;
+    return (c === "x" ? r : (r & 0x3) | 0x8).toString(16);
+  });
+}
+
+// ============================================================
+//  COOKIE HELPERS (shared across all tabs — primary anchor)
+// ============================================================
+const COOKIE_NAME    = "device_uuid";
+const COOKIE_DAYS    = 365 * 5; // 5 years
+
+function setCookie(name, value, days) {
+  const expires = new Date();
+  expires.setDate(expires.getDate() + days);
+  // SameSite=Lax works on Safari, Secure only if HTTPS
+  const secure = location.protocol === "https:" ? ";Secure" : "";
+  document.cookie = `${name}=${value};expires=${expires.toUTCString()};path=/${secure};SameSite=Lax`;
+}
+
+function getCookie(name) {
+  const match = document.cookie.match(new RegExp("(^| )" + name + "=([^;]+)"));
+  return match ? match[2] : null;
+}
+
+// ============================================================
+//  INDEXEDDB HELPERS (backup layer)
+// ============================================================
+const DB_NAME    = "device_db";
+const DB_VERSION = 1;
+const STORE_NAME = "fingerprint";
+const IDB_KEY    = "device_uuid";
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = e => e.target.result.createObjectStore(STORE_NAME);
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror   = e => reject(e.target.error);
+  });
+}
+
+function idbGet(db, key) {
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(STORE_NAME, "readonly").objectStore(STORE_NAME).get(key);
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror   = e => reject(e.target.error);
+  });
+}
+
+function idbSet(db, key, value) {
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(STORE_NAME, "readwrite").objectStore(STORE_NAME).put(value, key);
+    req.onsuccess = () => resolve();
+    req.onerror   = e => reject(e.target.error);
+  });
+}
+
+// ============================================================
+//  GET OR CREATE UUID
+//  Priority: Cookie → IndexedDB → Generate new
+//  Saves to both so they sync each other
+// ============================================================
+async function getDeviceUUID() {
+  // 1. Check cookie first (shared across all tabs)
+  const cookieUUID = getCookie(COOKIE_NAME);
+  if (cookieUUID) {
+    // Sync to IndexedDB silently
+    try {
+      const db = await openDB();
+      const idbUUID = await idbGet(db, IDB_KEY);
+      if (!idbUUID) await idbSet(db, IDB_KEY, cookieUUID);
+    } catch (_) {}
+    return cookieUUID;
+  }
+
+  // 2. Check IndexedDB (fallback)
+  try {
+    const db = await openDB();
+    const idbUUID = await idbGet(db, IDB_KEY);
+    if (idbUUID) {
+      // Sync back to cookie
+      setCookie(COOKIE_NAME, idbUUID, COOKIE_DAYS);
+      return idbUUID;
+    }
+
+    // 3. Neither exists — generate new UUID, save to both
+    const uuid = generateUUID();
+    await idbSet(db, IDB_KEY, uuid);
+    setCookie(COOKIE_NAME, uuid, COOKIE_DAYS);
+    return uuid;
+
+  } catch (err) {
+    // IndexedDB blocked — try cookie only
+    console.warn("IndexedDB unavailable:", err);
+    const uuid = generateUUID();
+    setCookie(COOKIE_NAME, uuid, COOKIE_DAYS);
+    return uuid;
+  }
+}
+
+// ============================================================
+//  STABLE SIGNALS
+// ============================================================
+function getStableSignals() {
+  return {
+    cpu:         navigator.hardwareConcurrency || 0,
+    memory:      navigator.deviceMemory        || 0,
+    touchPoints: navigator.maxTouchPoints      || 0,
+    pixelRatio:  Math.round(window.devicePixelRatio * 10) / 10,
+    colorDepth:  screen.colorDepth,
+    screen:
+      Math.max(screen.width, screen.height) +
+      "x" +
+      Math.min(screen.width, screen.height),
+    timezone:    Intl.DateTimeFormat().resolvedOptions().timeZone,
+    language:    navigator.language,
+    platform:    navigator.platform || "",
+  };
+}
+
+// ============================================================
+//  FINGERPRINT
+// ============================================================
+async function fingerprint() {
+  const uuid    = await getDeviceUUID();
+  const signals = getStableSignals();
+  return await generateHash(JSON.stringify({ uuid, ...signals }));
+}
+console.log("Device fingerprinting initialized");
+const fpPromise = fingerprint().then(fp => alert(fp)).catch(err => console.error("Fingerprinting error:", err));
+// console.log(fpPromise)
+// ============================================================
+//  FORM HANDLER
+// ============================================================
+async function handleRegister(event) {
+  event.preventDefault();
+
+  const deviceName = document.getElementById('deviceName').value.trim();
+  const storeName  = document.getElementById('storeName').value.trim();
+  const addedBy    = document.getElementById('addedBy').value.trim();
+  const remarks    = document.getElementById('remarks').value.trim();
+
+  if (!deviceName || !storeName || !addedBy) {
+    document.getElementById('errorMsg').textContent = 'Please fill in all required fields';
+    document.getElementById('errorMsg').style.display = 'block';
+    return;
+  }
+
+  const btn = document.getElementById('registerBtn');
+  btn.disabled = true;
+  btn.classList.add('loading');
+  btn.textContent = 'Registering...';
+
+  try {
+    const fp = await fingerprint();
+
+    const response = await fetch("http://3.109.209.50:5000/api/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: 'include',
+      body: JSON.stringify({
+        fingerprint: fp,
+        deviceName:  deviceName,
+        storeName:   storeName,
+        addedBy:     addedBy,
+        remarks:     remarks,
+        oldToken:    document.cookie || null
+      })
+    });
+
+    if (!response.ok) throw new Error(`Registration failed: ${response.statusText}`);
+
+    document.getElementById('errorMsg').style.display = 'none';
+    alert('Device registered successfully!');
+    location.reload();
+
+  } catch (error) {
+    console.error('Registration error:', error);
+    document.getElementById('errorMsg').textContent = 'Registration failed. Please try again.';
+    document.getElementById('errorMsg').style.display = 'block';
+    btn.disabled = false;
+    btn.classList.remove('loading');
+    btn.textContent = 'Register Device';
+  }
+}
+</script>
+</body>
+</html>
