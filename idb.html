@@ -1,0 +1,86 @@
+<html>
+    <body>
+        test
+    </body>
+    <script>
+        const DB_NAME = "DeviceIdentificationDB";
+const STORE_NAME = "UUIDStore";
+const KEY_NAME = "shared_device_uuid";
+
+// 1. Promisified function to safely open IndexedDB
+function initIndexedDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, 1);
+
+    request.onupgradeneeded = (event) => {
+      const db = event.target.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME);
+      }
+    };
+
+    request.onsuccess = (event) => resolve(event.target.result);
+    request.onerror = (event) => reject(event.target.error);
+  });
+}
+
+// 2. Read the UUID with a dedicated transaction
+function readUUIDFromDB(db) {
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(STORE_NAME, "readonly");
+    const store = transaction.objectStore(STORE_NAME);
+    const request = store.get(KEY_NAME);
+
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+// 3. Write the UUID with a dedicated transaction
+function writeUUIDToDB(db, uuid) {
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(STORE_NAME, "readwrite");
+    const store = transaction.objectStore(STORE_NAME);
+    const request = store.put(uuid, KEY_NAME);
+
+    request.onsuccess = () => resolve(true);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+// 4. The Master Orchestrator (Call this when your app loads)
+async function getSharedUUID() {
+  try {
+    // Step A: Wait for the database connection to completely open
+    const db = await initIndexedDB();
+
+    // Step B: Attempt to read the existing UUID
+    let existingUUID = await readUUIDFromDB(db);
+
+    // Step C: If it exists, return it immediately. The tab uses the shared UUID.
+    if (existingUUID) {
+      console.log("Found existing shared UUID:", existingUUID);
+      alert("Found existing shared UUID: " + existingUUID);
+      return existingUUID;
+    }
+
+    // Step D: Only generate a new UUID if IndexedDB returned absolutely nothing
+    console.log("No UUID found. Generating a fresh one...");
+    const newUUID = crypto.randomUUID();
+
+    // Step E: Persist it immediately so the next tab can see it
+    await writeUUIDToDB(db, newUUID);
+    alert("Generated and stored new shared UUID: " + newUUID);
+    return newUUID;
+
+  } catch (error) {
+    console.error("IndexedDB operation failed:", error);
+    // Fallback if IndexedDB fails entirely (e.g., Private Browsing Mode)
+    return null; 
+  }
+}
+getSharedUUID().then(uuid => {
+  console.log("Shared UUID for this tab:", uuid);
+});
+    </script>
+</html>
