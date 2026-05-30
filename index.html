@@ -97,12 +97,31 @@ function generateUUID() {
 }
 
 // ============================================================
-//  INDEXEDDB
+//  COOKIE HELPERS (shared across all tabs — primary anchor)
+// ============================================================
+const COOKIE_NAME    = "device_uuid";
+const COOKIE_DAYS    = 365 * 5; // 5 years
+
+function setCookie(name, value, days) {
+  const expires = new Date();
+  expires.setDate(expires.getDate() + days);
+  // SameSite=Lax works on Safari, Secure only if HTTPS
+  const secure = location.protocol === "https:" ? ";Secure" : "";
+  document.cookie = `${name}=${value};expires=${expires.toUTCString()};path=/${secure};SameSite=Lax`;
+}
+
+function getCookie(name) {
+  const match = document.cookie.match(new RegExp("(^| )" + name + "=([^;]+)"));
+  return match ? match[2] : null;
+}
+
+// ============================================================
+//  INDEXEDDB HELPERS (backup layer)
 // ============================================================
 const DB_NAME    = "device_db";
 const DB_VERSION = 1;
 const STORE_NAME = "fingerprint";
-const UUID_KEY   = "device_uuid";
+const IDB_KEY    = "device_uuid";
 
 function openDB() {
   return new Promise((resolve, reject) => {
@@ -130,7 +149,50 @@ function idbSet(db, key, value) {
 }
 
 // ============================================================
-//  STABLE SIGNALS — same for all device types
+//  GET OR CREATE UUID
+//  Priority: Cookie → IndexedDB → Generate new
+//  Saves to both so they sync each other
+// ============================================================
+async function getDeviceUUID() {
+  // 1. Check cookie first (shared across all tabs)
+  const cookieUUID = getCookie(COOKIE_NAME);
+  if (cookieUUID) {
+    // Sync to IndexedDB silently
+    try {
+      const db = await openDB();
+      const idbUUID = await idbGet(db, IDB_KEY);
+      if (!idbUUID) await idbSet(db, IDB_KEY, cookieUUID);
+    } catch (_) {}
+    return cookieUUID;
+  }
+
+  // 2. Check IndexedDB (fallback)
+  try {
+    const db = await openDB();
+    const idbUUID = await idbGet(db, IDB_KEY);
+    if (idbUUID) {
+      // Sync back to cookie
+      setCookie(COOKIE_NAME, idbUUID, COOKIE_DAYS);
+      return idbUUID;
+    }
+
+    // 3. Neither exists — generate new UUID, save to both
+    const uuid = generateUUID();
+    await idbSet(db, IDB_KEY, uuid);
+    setCookie(COOKIE_NAME, uuid, COOKIE_DAYS);
+    return uuid;
+
+  } catch (err) {
+    // IndexedDB blocked — try cookie only
+    console.warn("IndexedDB unavailable:", err);
+    const uuid = generateUUID();
+    setCookie(COOKIE_NAME, uuid, COOKIE_DAYS);
+    return uuid;
+  }
+}
+
+// ============================================================
+//  STABLE SIGNALS
 // ============================================================
 function getStableSignals() {
   return {
@@ -150,38 +212,16 @@ function getStableSignals() {
 }
 
 // ============================================================
-//  GET OR CREATE UUID FROM INDEXEDDB
-// ============================================================
-async function getDeviceUUID() {
-  try {
-    const db     = await openDB();
-    const stored = await idbGet(db, UUID_KEY);
-    if (stored) return stored;          // reuse forever
-
-    const uuid = generateUUID();        // first time
-    await idbSet(db, UUID_KEY, uuid);   // save permanently
-    return uuid;
-  } catch (err) {
-    // IndexedDB blocked (private/incognito) — won't persist
-    console.warn("IndexedDB unavailable:", err);
-    return generateUUID();
-  }
-}
-
-// ============================================================
-//  FINGERPRINT — all devices same method
+//  FINGERPRINT
 // ============================================================
 async function fingerprint() {
   const uuid    = await getDeviceUUID();
   const signals = getStableSignals();
   return await generateHash(JSON.stringify({ uuid, ...signals }));
 }
-
 console.log("Device fingerprinting initialized");
 const fpPromise = fingerprint().then(fp => alert(fp)).catch(err => console.error("Fingerprinting error:", err));
 // console.log(fpPromise)
-
-
 // ============================================================
 //  FORM HANDLER
 // ============================================================
